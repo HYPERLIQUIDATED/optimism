@@ -1771,32 +1771,84 @@ contract OptimismPortal2_FinalizeWithdrawalTransaction_Test is OptimismPortal2_T
     }
 
     /// @notice Tests that finalization reverts or supplies the minimum gas and records finalization.
-    function testFuzz_finalizeWithdrawalTransaction_minGasInvariant_succeeds(uint256 _gas) external {
-        _gas = bound(_gas, 0, 1_000_000);
+    function testFuzz_finalizeWithdrawalTransaction_minGasInvariant_succeeds(
+        address _target,
+        uint256 _value,
+        uint256 _gasLimit,
+        uint256 _gas
+    )
+        external
+    {
+        // Prevent calls to system contracts
+        vm.assume(_target != address(optimismPortal2) && _target != address(ethLockbox));
+        // Prevent calls to vm and console
+        vm.assume(_target != address(vm) && _target != CONSOLE);
 
-        // Record gas at target entry: GAS, PUSH1 0, SSTORE. A nonzero slot avoids state-creation costs.
-        vm.etch(_defaultTx.target, hex"5a600055");
-        vm.store(_defaultTx.target, bytes32(0), bytes32(uint256(1)));
+        Types.WithdrawalTransaction memory _tx = _defaultTx;
+        _tx.target = _target;
+        // CGT withdrawals carry no ETH; cap ETH values at a generous supply bound.
+        _tx.value = isUsingCustomGasToken() ? 0 : bound(_value, 0, 200_000_000 ether);
+        // Bound the gas request so the outer-call budget remains practical for fuzzing.
+        _tx.gasLimit = bound(_gasLimit, 0, 30_000_000);
+        // Cover underfunded calls and calls with ample gas for forwarding and Portal overhead.
+        _gas = bound(_gas, 0, 2 * _tx.gasLimit + 1_000_000);
 
-        optimismPortal2.proveWithdrawalTransaction(_defaultTx, _proposedGameIndex, _outputRootProof, _withdrawalProof);
+        bytes32 withdrawalHash = _prepareWithdrawalForFinalization(_tx);
+
+        // expectCallMinGas adds the 2,300-gas stipend for nonzero-value calls.
+        uint64 minGas = uint64(_tx.gasLimit);
+        if (_tx.value > 0) {
+            minGas = minGas > 2300 ? minGas - 2300 : 0;
+        }
+        vm.expectCallMinGas(_tx.target, _tx.value, minGas, _tx.data);
+        (bool success,) = address(optimismPortal2).call{ gas: _gas }(
+            abi.encodeCall(optimismPortal2.finalizeWithdrawalTransaction, (_tx))
+        );
+
+        // Reverts satisfy the invariant; only successful finalizations must meet the call expectation.
+        vm.assume(success);
+        assertTrue(optimismPortal2.finalizedWithdrawals(withdrawalHash));
+    }
+
+    /// @notice Prepares a funded, proven withdrawal that is eligible for finalization.
+    function _prepareWithdrawalForFinalization(Types.WithdrawalTransaction memory _tx) internal returns (bytes32) {
+        vm.deal(address(optimismPortal2), _tx.value);
+        if (isUsingLockbox()) {
+            vm.deal(address(ethLockbox), _tx.value);
+        }
+
+        (
+            bytes32 stateRoot,
+            bytes32 storageRoot,
+            bytes32 outputRoot,
+            bytes32 withdrawalHash,
+            bytes[] memory withdrawalProof
+        ) = ffi.getProveWithdrawalTransactionInputs(_tx);
+        Types.OutputRootProof memory proof = Types.OutputRootProof({
+            version: bytes32(0),
+            stateRoot: stateRoot,
+            messagePasserStorageRoot: storageRoot,
+            latestBlockhash: bytes32(0)
+        });
+        if (DisputeGames.isSuperGame(game.gameType())) {
+            vm.mockCall(
+                address(game),
+                abi.encodeCall(game.rootClaimByChainId, (systemConfig.l2ChainId())),
+                abi.encode(outputRoot)
+            );
+        } else {
+            vm.mockCall(address(game), abi.encodeCall(game.rootClaim, ()), abi.encode(outputRoot));
+        }
+
+        optimismPortal2.proveWithdrawalTransaction(_tx, _proposedGameIndex, proof, withdrawalProof);
         game.resolveClaim(0, 0);
         game.resolve();
         vm.warp(
             block.timestamp + optimismPortal2.proofMaturityDelaySeconds()
                 + optimismPortal2.disputeGameFinalityDelaySeconds() + 1
         );
-        optimismPortal2.checkWithdrawal(_withdrawalHash, address(this));
-
-        (bool success,) = address(optimismPortal2).call{ gas: _gas }(
-            abi.encodeCall(optimismPortal2.finalizeWithdrawalTransaction, (_defaultTx))
-        );
-
-        assertEq(optimismPortal2.finalizedWithdrawals(_withdrawalHash), success);
-        if (success) {
-            // GAS reports the remaining gas after its own two-gas cost.
-            uint256 entryGas = uint256(vm.load(_defaultTx.target, bytes32(0))) + 2;
-            assertGe(entryGas, _defaultTx.gasLimit);
-        }
+        optimismPortal2.checkWithdrawal(withdrawalHash, address(this));
+        return withdrawalHash;
     }
 
     /// @notice Tests that `finalizeWithdrawalTransaction` reverts if a sub-call attempts to
