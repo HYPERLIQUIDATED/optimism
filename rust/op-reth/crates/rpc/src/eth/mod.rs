@@ -22,6 +22,7 @@ use op_alloy_network::Optimism;
 use op_alloy_rpc_types_engine::OpFlashblockPayloadBase;
 pub use receipt::{OpReceiptBuilder, OpReceiptFieldsBuilder};
 use reqwest::Url;
+use reth_chain_state::CanonStateSubscriptions;
 use reth_chainspec::{EthereumHardforks, Hardforks};
 use reth_evm::ConfigureEvm;
 use reth_node_api::{FullNodeComponents, FullNodeTypes, HeaderTy, NodeTypes};
@@ -620,7 +621,8 @@ where
                 ctx.components.task_executor().clone(),
                 // enable state root calculation if flashblock_consensus is enabled.
                 flashblock_consensus,
-            );
+            )
+            .with_canonical_state_rx(ctx.components.provider().subscribe_to_canonical_state());
 
             let flashblocks_sequence = service.block_sequence_broadcaster().clone();
             let received_flashblocks = service.flashblocks_broadcaster().clone();

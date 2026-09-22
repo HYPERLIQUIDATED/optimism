@@ -11,6 +11,7 @@ use alloy_primitives::B256;
 use futures_util::{FutureExt, Stream, StreamExt};
 use metrics::{Counter, Gauge, Histogram};
 use op_alloy_rpc_types_engine::OpFlashblockPayloadBase;
+use reth_chain_state::CanonStateNotification;
 use reth_evm::ConfigureEvm;
 use reth_metrics::Metrics;
 use reth_primitives_traits::{AlloyBlockHeader, BlockTy, HeaderTy, NodePrimitives, ReceiptTy};
@@ -21,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{mpsc, oneshot, watch},
+    sync::{broadcast, mpsc, oneshot, watch},
     time::sleep,
 };
 use tracing::*;
@@ -61,6 +62,8 @@ pub struct FlashBlockService<
     incoming_flashblock_rx: S,
     /// Receiver for canonical block notifications (bounded to prevent OOM).
     canonical_block_rx: Option<mpsc::Receiver<CanonicalBlockNotification>>,
+    /// Execution-client canonical updates used to wake stalled builds.
+    canonical_state_rx: Option<broadcast::Receiver<CanonStateNotification<N>>>,
     /// Signals when a block build is in progress.
     in_progress_tx: watch::Sender<Option<FlashBlockBuildInfo>>,
     /// Broadcast channel to forward received flashblocks from the subscription.
@@ -123,6 +126,7 @@ where
         Self {
             incoming_flashblock_rx,
             canonical_block_rx: None,
+            canonical_state_rx: None,
             in_progress_tx,
             received_flashblocks_tx,
             builder: FlashBlockBuilder::new(evm_config, provider),
@@ -149,6 +153,18 @@ where
         rx: mpsc::Receiver<CanonicalBlockNotification>,
     ) -> Self {
         self.canonical_block_rx = Some(rx);
+        self
+    }
+
+    /// Sets the canonical update subscription used to wake builds waiting for their parent.
+    ///
+    /// Subscribe before starting the service. The provider must expose the new canonical
+    /// state before sending a notification; build selection reads that state directly.
+    pub fn with_canonical_state_rx(
+        mut self,
+        rx: broadcast::Receiver<CanonStateNotification<N>>,
+    ) -> Self {
+        self.canonical_state_rx = Some(rx);
         self
     }
 
@@ -328,6 +344,27 @@ where
                         None => {
                             warn!(target: "flashblocks", "Flashblock stream ended");
                             break;
+                        }
+                    }
+                }
+
+                // Execution-client updates also wake builds waiting for their canonical parent.
+                notification = async {
+                    match self.canonical_state_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match notification {
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            // Re-read the provider even after missed notifications. These are
+                            // wakeups, not fingerprints: cached flashblocks may be only a prefix
+                            // of the final canonical block.
+                            self.try_start_build_job();
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            // A closed receiver is always ready; disable it to avoid spinning.
+                            self.canonical_state_rx = None;
                         }
                     }
                 }
@@ -540,4 +577,144 @@ struct FlashBlockServiceMetrics {
     drain_followup_started: Counter,
     /// Number of follow-up attempts where no buildable work was available.
     drain_followup_noop: Counter,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::TestFlashBlockFactory;
+    use alloy_consensus::Header;
+    use futures_util::stream;
+    use reth_execution_types::{Chain, ExecutionOutcome};
+    use reth_optimism_chainspec::{OP_MAINNET, OpChainSpec};
+    use reth_optimism_evm::OpEvmConfig;
+    use reth_optimism_primitives::{OpBlock, OpPrimitives};
+    use reth_primitives_traits::RecoveredBlock;
+    use reth_provider::test_utils::MockEthProvider;
+
+    type Provider = MockEthProvider<OpPrimitives, Arc<OpChainSpec>>;
+    type TestService = FlashBlockService<
+        OpPrimitives,
+        stream::Pending<eyre::Result<FlashBlock>>,
+        OpEvmConfig,
+        Provider,
+    >;
+
+    /// Queue index zero before its parent exists in the canonical provider.
+    fn waiting_service(partial_parent: bool) -> (TestService, Provider, RecoveredBlock<OpBlock>) {
+        let provider = MockEthProvider::<OpPrimitives>::new()
+            .with_chain_spec(OP_MAINNET.clone())
+            .with_genesis_block();
+        let genesis = provider.latest_header().unwrap().unwrap();
+        let parent = RecoveredBlock::new_unhashed(
+            OpBlock {
+                header: Header {
+                    number: genesis.number() + 2,
+                    parent_hash: B256::repeat_byte(0x77),
+                    timestamp: genesis.timestamp() + 2,
+                    gas_limit: 30_000_000,
+                    base_fee_per_gas: Some(1_000_000_000),
+                    ..Default::default()
+                },
+                body: Default::default(),
+            },
+            Vec::new(),
+        );
+        let mut service = FlashBlockService::new(
+            stream::pending(),
+            OpEvmConfig::optimism(OP_MAINNET.clone()),
+            provider.clone(),
+            TaskExecutor::test(),
+            false,
+        );
+        if partial_parent {
+            // The node is still behind this parent. Its cached flashblocks describe only
+            // a prefix, so their last hash differs from the subsequently committed block.
+            service.process_flashblock(
+                TestFlashBlockFactory::new()
+                    .builder()
+                    .block_number(parent.number())
+                    .parent_hash(parent.parent_hash())
+                    .timestamp(parent.timestamp())
+                    .block_hash(B256::repeat_byte(0x88))
+                    .build(),
+            );
+        }
+        service.process_flashblock(
+            TestFlashBlockFactory::new()
+                .builder()
+                .block_number(parent.number() + 1)
+                .parent_hash(parent.hash())
+                .timestamp(parent.timestamp() + 2)
+                .build(),
+        );
+        assert!(!service.try_start_build_job(), "parent is not canonical yet");
+        (service, provider, parent)
+    }
+
+    fn commit(blocks: Vec<RecoveredBlock<OpBlock>>) -> CanonStateNotification<OpPrimitives> {
+        CanonStateNotification::Commit {
+            new: Arc::new(Chain::new(blocks, ExecutionOutcome::default(), Default::default())),
+        }
+    }
+
+    #[test_case::test_case(false, false; "parent_commit")]
+    #[test_case::test_case(true, false; "partial_parent_cache")]
+    #[test_case::test_case(false, true; "lagged_subscription")]
+    #[tokio::test]
+    async fn canonical_update_wakes_build(partial_parent: bool, lagged: bool) {
+        let (service, provider, parent) = waiting_service(partial_parent);
+        let (canonical_tx, canonical_rx) = broadcast::channel(1);
+        let service = service.with_canonical_state_rx(canonical_rx);
+        let (pending_tx, mut pending_rx) = watch::channel(None);
+        let run = service.run(pending_tx);
+        tokio::pin!(run);
+        assert!(run.as_mut().now_or_never().is_none());
+        assert!(pending_rx.borrow().is_none());
+
+        provider.add_block(parent.hash(), parent.clone().into_block());
+        canonical_tx.send(commit(vec![parent.clone()])).unwrap();
+        if lagged {
+            canonical_tx.send(commit(vec![parent.clone()])).unwrap();
+        }
+        let pending = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                () = &mut run => panic!("service stopped before publishing"),
+                pending = pending_rx.wait_for(Option::is_some) => pending.unwrap().clone().unwrap(),
+            }
+        })
+        .await
+        .expect("must publish index zero without another flashblock");
+        assert_eq!(pending.last_flashblock_index, 0);
+        assert_eq!(pending.block().number(), parent.number() + 1);
+        assert_eq!(pending.block().parent_hash(), parent.hash());
+    }
+    #[tokio::test]
+    async fn canonical_receiver_close_does_not_spin() {
+        let provider = MockEthProvider::<OpPrimitives>::new()
+            .with_chain_spec(OP_MAINNET.clone())
+            .with_genesis_block();
+        let mut polls = 0;
+        let stream = stream::poll_fn(move |_| {
+            polls += 1;
+            // At most one poll before handling closure and one after disabling the receiver.
+            // A timeout alone cannot reliably catch a select loop that never yields.
+            assert!(polls <= 2, "closed canonical receiver caused a busy loop");
+            std::task::Poll::Pending
+        });
+        let (canonical_tx, canonical_rx) = broadcast::channel(1);
+        let service = FlashBlockService::new(
+            stream,
+            OpEvmConfig::optimism(OP_MAINNET.clone()),
+            provider,
+            TaskExecutor::test(),
+            false,
+        )
+        .with_canonical_state_rx(canonical_rx);
+        drop(canonical_tx);
+        let (pending_tx, _pending_rx) = watch::channel(None);
+        let run = service.run(pending_tx);
+        tokio::pin!(run);
+        assert!(run.as_mut().now_or_never().is_none());
+    }
 }
