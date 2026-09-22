@@ -627,9 +627,9 @@ fn lagoon_l1_block_info() -> op_revm::L1BlockInfo {
     }
 }
 
-/// A post-exec (`0x7D`) receipt reports zero for the transaction-scoped L1 fee fields, and
-/// reports every block-scoped L1 fee parameter exactly as a regular transaction's receipt in
-/// the same block does.
+/// A post-exec (`0x7D`) receipt reports zero for the transaction-scoped L1 fee fields, omits the
+/// Ecotone-removed `l1FeeScalar`, and reports every block-scoped L1 fee parameter exactly as a
+/// regular transaction's receipt in the same block does.
 ///
 /// Specs: <https://specs.optimism.io/protocol/lagoon/post-exec.html#json-rpc-fields>
 #[test]
@@ -682,10 +682,13 @@ fn post_exec_receipt_zeroes_tx_scoped_l1_fee_fields() {
     assert_eq!(l1_fee, Some(0), "a post-exec transaction pays no L1 fee");
     assert_eq!(l1_gas_used, Some(0), "a post-exec transaction is charged no L1 gas");
 
+    // Ecotone removed `l1FeeScalar`, so a Lagoon-era receipt omits it outright. Comparing it to
+    // the regular receipt would pass vacuously on `None == None`.
+    assert!(l1_fee_scalar.is_none(), "l1FeeScalar is excluded after Ecotone");
+
     // Block-scoped: identical value *and* presence to the regular receipt in the same block.
     let expected = regular_fields.l1_block_info;
     assert_eq!(l1_gas_price, expected.l1_gas_price, "l1GasPrice is block-scoped");
-    assert_eq!(l1_fee_scalar, expected.l1_fee_scalar, "l1FeeScalar is block-scoped");
     assert_eq!(l1_base_fee_scalar, expected.l1_base_fee_scalar, "l1BaseFeeScalar is block-scoped");
     assert_eq!(l1_blob_base_fee, expected.l1_blob_base_fee, "l1BlobBaseFee is block-scoped");
     assert_eq!(
