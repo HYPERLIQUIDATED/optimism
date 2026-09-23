@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,8 +49,10 @@ func (s *scoreRecord) UnmarshalBinary(data []byte) error {
 }
 
 type scoreBook struct {
-	mu   sync.RWMutex
-	book *recordsBook[peer.ID, *scoreRecord]
+	// Serialize writes without holding mu during persistence.
+	writeMu sync.Mutex
+	mu      sync.RWMutex
+	book    *recordsBook[peer.ID, *scoreRecord]
 }
 
 func peerIDKey(id peer.ID) ds.Key {
@@ -90,10 +93,27 @@ func (d *scoreBook) GetPeerScore(id peer.ID) (float64, error) {
 }
 
 func (d *scoreBook) SetScore(id peer.ID, diff ScoreDiff) (PeerScores, error) {
+	d.writeMu.Lock()
+	defer d.writeMu.Unlock()
+
+	scores, err := d.GetPeerScores(id)
+	if err != nil {
+		return PeerScores{}, err
+	}
+	next := &scoreRecord{PeerScores: scores}
+	next.SetLastUpdated(d.book.clock.Now())
+	diff.Apply(next)
+	data, err := next.MarshalBinary()
+	if err != nil {
+		return PeerScores{}, fmt.Errorf("failed to encode record for key %v: %w", id, err)
+	}
+	if err := d.book.store.Put(d.book.ctx, d.book.dsKey(id), data); err != nil {
+		return PeerScores{}, fmt.Errorf("storing updated record for key %v: %w", id, err)
+	}
 	d.mu.Lock()
-	defer d.mu.Unlock()
-	v, err := d.book.setRecord(id, diff)
-	return v.PeerScores, err
+	d.book.cache.Add(id, next)
+	d.mu.Unlock()
+	return next.PeerScores, nil
 }
 
 func (d *scoreBook) Close() {
