@@ -16,14 +16,52 @@ use crate::{
 use alloy_eips::eip2718::WithEncoded;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::PayloadId;
+use rayon::prelude::*;
 use reth_primitives_traits::{
     NodePrimitives, Recovered, SignedTransaction, transaction::TxHashRef,
 };
 use reth_revm::cached::CachedReads;
 use ringbuffer::{AllocRingBuffer, RingBuffer};
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::LazyLock,
+};
 use tokio::sync::broadcast;
 use tracing::*;
+
+// Keep crypto work bounded and separate from reth's proof workers.
+static RECOVERY_POOL: LazyLock<Option<rayon::ThreadPool>> = LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(8)
+        .thread_name(|i| format!("fb-recover-{i}"))
+        .build()
+        .map_err(|error| warn!(%error, "Using serial signature recovery"))
+        .ok()
+});
+
+fn recover_transactions<T: SignedTransaction>(
+    flashblock: &FlashBlock,
+) -> Result<Vec<WithEncoded<Recovered<T>>>, alloy_consensus::crypto::RecoveryError> {
+    if flashblock.raw_transactions().len() >= 8 &&
+        let Some(pool) = RECOVERY_POOL.as_ref()
+    {
+        // Indexed parallel collection preserves transaction order; any invalid
+        // transaction fails the entire message before it is inserted.
+        return pool.install(|| {
+            flashblock
+                .raw_transactions()
+                .par_iter()
+                .map(|raw| {
+                    let tx = op_alloy_consensus::decode_2718_canonical::<T>(raw)
+                        .map_err(alloy_consensus::crypto::RecoveryError::from_source)?;
+                    alloy_consensus::transaction::SignerRecoverable::try_into_recovered(tx)
+                        .map(|tx| tx.into_encoded_with(raw.clone()))
+                })
+                .collect()
+        });
+    }
+    flashblock.recover_transactions().collect()
+}
 
 /// Maximum number of cached sequences in the ring buffer.
 const CACHE_SIZE: usize = 3;
@@ -178,7 +216,7 @@ impl<T: SignedTransaction> PendingSequence<T> {
         }
 
         // Only recover transactions once we've validated that this flashblock is accepted.
-        let recovered_txs = flashblock.recover_transactions().collect::<Result<Vec<_>, _>>()?;
+        let recovered_txs = recover_transactions(&flashblock)?;
         let flashblock_index = flashblock.index;
 
         // Index 0 starts a fresh pending block, so clear any stale in-progress data.
@@ -245,6 +283,7 @@ pub(crate) struct SequenceManager<T: SignedTransaction> {
 impl<T: SignedTransaction> SequenceManager<T> {
     /// Creates a new sequence manager.
     pub(crate) fn new(compute_state_root: bool) -> Self {
+        let _ = LazyLock::force(&RECOVERY_POOL);
         let (block_broadcaster, _) = broadcast::channel(128);
         Self {
             pending: PendingSequence::new(),

@@ -13327,6 +13327,7 @@ dependencies = [
  "op-alloy-consensus",
  "op-alloy-rpc-types-engine",
  "op-revm",
+ "rayon",
  "reth-chain-state",
  "reth-engine-primitives",
  "reth-errors",
