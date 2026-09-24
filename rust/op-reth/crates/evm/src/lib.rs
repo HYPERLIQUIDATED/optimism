@@ -222,7 +222,7 @@ where
     }
 }
 
-/// UPSTREAM-MIRROR(copy): reth@rev:aef8d3e `reth_evm_ethereum::EthEvmConfig`
+/// UPSTREAM-MIRROR(copy): reth@rev:480216f `reth_evm_ethereum::EthEvmConfig`
 ///
 /// Mirrors upstream `ConfigureEvm` plumbing with OP environments and execution context.
 impl<ChainSpec, N, R, EvmF> ConfigureEvm for OpEvmConfig<ChainSpec, N, R, EvmF>
@@ -322,7 +322,7 @@ where
     }
 }
 
-/// UPSTREAM-MIRROR(copy): reth@rev:aef8d3e `reth_evm_ethereum::EthEvmConfig`
+/// UPSTREAM-MIRROR(copy): reth@rev:480216f `reth_evm_ethereum::EthEvmConfig`
 ///
 /// Mirrors upstream payload-to-EVM configuration with OP payload and fork semantics.
 #[cfg(feature = "std")]

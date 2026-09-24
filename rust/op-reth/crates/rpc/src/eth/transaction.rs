@@ -79,7 +79,7 @@ where
         Ok(hash)
     }
 
-    /// UPSTREAM-MIRROR(override): reth@rev:aef8d3e
+    /// UPSTREAM-MIRROR(override): reth@rev:480216f
     /// `reth_rpc_eth_api::helpers::EthTransactions::send_raw_transaction_sync`
     ///
     /// Derived from the upstream default: the timeout computation is taken verbatim and the
@@ -171,7 +171,7 @@ where
     ///
     /// With flashblocks, we should also lookup the pending block for the transaction
     /// because this is considered confirmed/mined.
-    /// UPSTREAM-MIRROR(override): reth@rev:aef8d3e
+    /// UPSTREAM-MIRROR(override): reth@rev:480216f
     /// `reth_rpc_eth_api::helpers::EthTransactions::transaction_receipt`
     ///
     /// Extends the upstream default with a flashblock receipt lookup.
@@ -206,7 +206,7 @@ where
     OpEthApiError: FromEvmError<N::Evm>,
     Rpc: RpcConvert<Primitives = N::Primitives, Error = OpEthApiError>,
 {
-    /// UPSTREAM-MIRROR(override): reth@rev:aef8d3e
+    /// UPSTREAM-MIRROR(override): reth@rev:480216f
     /// `reth_rpc_eth_api::helpers::LoadTransaction::transaction_by_hash`
     ///
     /// Extends the upstream disk/cache/pool lookup with flashblocks.

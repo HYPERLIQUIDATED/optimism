@@ -25,7 +25,7 @@ pub struct OpNextBlockEnvAttributes {
 impl<H: alloy_consensus::BlockHeader> reth_rpc_eth_api::helpers::pending_block::BuildPendingEnv<H>
     for OpNextBlockEnvAttributes
 {
-    /// UPSTREAM-MIRROR(copy): reth@rev:aef8d3e
+    /// UPSTREAM-MIRROR(copy): reth@rev:480216f
     /// `reth_rpc_eth_api::helpers::pending_block::NextBlockEnvAttributes::build_pending_env`
     ///
     /// Copies upstream pending-environment defaults for the OP attribute type.
