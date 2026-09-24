@@ -313,37 +313,44 @@ impl<T: SignedTransaction> SequenceManager<T> {
     /// pending sequence is finalized, cached, and broadcast immediately. If the sequence
     /// is later built on top of local tip, `on_build_complete()` will broadcast again
     /// with computed `state_root`.
+    /// Invalid previous sequences are discarded without rejecting the new index 0.
     ///
     /// Transactions are recovered once and cached for reuse during block building.
     pub(crate) fn insert_flashblock(&mut self, flashblock: FlashBlock) -> eyre::Result<()> {
         // If this starts a new block, finalize and cache the previous sequence BEFORE inserting
         if flashblock.index == 0 && self.pending.count() > 0 {
-            let (completed, txs) = self.pending.finalize()?;
-            let block_number = completed.block_number();
-            let parent_hash = completed.payload_base().parent_hash;
+            match self.pending.finalize() {
+                Ok((completed, txs)) => {
+                    let block_number = completed.block_number();
+                    let parent_hash = completed.payload_base().parent_hash;
 
-            trace!(
-                target: "flashblocks",
-                block_number,
-                %parent_hash,
-                cache_size = self.completed_cache.len(),
-                "Caching completed flashblock sequence"
-            );
+                    trace!(
+                        target: "flashblocks",
+                        block_number,
+                        %parent_hash,
+                        cache_size = self.completed_cache.len(),
+                        "Caching completed flashblock sequence"
+                    );
 
-            // Broadcast immediately to consensus client (even without state_root)
-            // This ensures sequences are forwarded during catch-up even if not buildable on tip.
-            // ConsensusClient checks execution_outcome and skips newPayload if state_root is zero.
-            if self.block_broadcaster.receiver_count() > 0 {
-                let _ = self.block_broadcaster.send(completed.clone());
+                    // Broadcast immediately to consensus client (even without state_root)
+                    // This ensures sequences are forwarded during catch-up even if not buildable on
+                    // tip. ConsensusClient checks execution_outcome and skips
+                    // newPayload if state_root is zero.
+                    if self.block_broadcaster.receiver_count() > 0 {
+                        let _ = self.block_broadcaster.send(completed.clone());
+                    }
+
+                    // Bundle completed sequence with its decoded transactions and push to cache
+                    // Ring buffer automatically evicts oldest entry when full
+                    self.push_completed_sequence(completed, txs);
+                }
+                Err(error) => {
+                    warn!(target: "flashblocks", %error, "Discarding invalid previous flashblock sequence");
+                }
             }
-
-            // Bundle completed sequence with its decoded transactions and push to cache
-            // Ring buffer automatically evicts oldest entry when full
-            self.push_completed_sequence(completed, txs);
         }
 
-        self.pending.insert_flashblock(flashblock)?;
-        Ok(())
+        self.pending.insert_flashblock(flashblock)
     }
 
     /// Pushes a completed sequence into the cache and maintains cached min block-number metadata.
@@ -957,6 +964,49 @@ mod tests {
         assert_eq!(manager.completed_cache.len(), 1);
         let (cached_sequence, _txs) = manager.completed_cache.get(0).unwrap();
         assert_eq!(cached_sequence.block_number(), 100);
+    }
+
+    #[test]
+    fn test_incomplete_previous_sequence_does_not_drop_next_block() {
+        let mut manager: SequenceManager<OpTxEnvelope> = SequenceManager::new(true);
+        let mut completed = manager.subscribe_block_sequence();
+        let factory = TestFlashBlockFactory::new();
+
+        let fb100_0 = factory.flashblock_at(0).build();
+        let old_parent = fb100_0.base.as_ref().unwrap().parent_hash;
+        let fb100_2 = factory.flashblock_after(&fb100_0).index(2).build();
+        manager.insert_flashblock(fb100_0).unwrap();
+        manager.insert_flashblock(fb100_2.clone()).unwrap();
+
+        // Missing index 1 invalidates block 100, but must not consume block 101's base.
+        let fb101_0 = factory.flashblock_for_next_block(&fb100_2).build();
+        let parent = fb101_0.base.as_ref().unwrap().parent_hash;
+        manager.insert_flashblock(fb101_0.clone()).unwrap();
+        let fb101_1 = factory.flashblock_after(&fb101_0).build();
+        manager.insert_flashblock(fb101_1.clone()).unwrap();
+        assert_eq!(manager.pending().block_number(), Some(101));
+        assert_eq!(manager.pending().count(), 2);
+        assert!(manager.completed_cache.is_empty());
+        assert!(completed.try_recv().is_err());
+
+        // Keep both batches while their parent is unavailable; build them once it is ready.
+        assert!(manager.next_buildable_args::<OpPrimitives>(old_parent, 1_000_000, None).is_none());
+        let candidate =
+            manager.next_buildable_args::<OpPrimitives>(parent, 1_000_000, None).unwrap();
+        assert_eq!(candidate.base.block_number, 101);
+        assert_eq!(candidate.base.parent_hash, parent);
+        assert_eq!(candidate.last_flashblock_index, 1);
+        assert_eq!(candidate.last_flashblock_hash, fb101_1.diff.block_hash);
+
+        // If another block arrives before execution, the recovered sequence remains cacheable.
+        let fb102_0 = factory.flashblock_for_next_block(&fb101_1).build();
+        manager.insert_flashblock(fb102_0).unwrap();
+        assert_eq!(completed.try_recv().unwrap().block_number(), 101);
+        assert_eq!(manager.completed_cache.len(), 1);
+        let candidate =
+            manager.next_buildable_args::<OpPrimitives>(parent, 1_000_000, None).unwrap();
+        assert_eq!(candidate.base.block_number, 101);
+        assert_eq!(candidate.last_flashblock_index, 1);
     }
 
     #[test]
