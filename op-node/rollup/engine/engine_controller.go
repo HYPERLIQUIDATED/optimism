@@ -9,7 +9,6 @@ import (
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/rpc"
 
 	opmetrics "github.com/ethereum-optimism/optimism/op-node/metrics"
@@ -19,6 +18,7 @@ import (
 	"github.com/ethereum-optimism/optimism/op-service/clock"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum-optimism/optimism/op-service/event"
+	"github.com/ethereum-optimism/optimism/op-service/log"
 )
 
 type syncStatusEnum int
@@ -243,8 +243,13 @@ func (e *EngineController) SafeL2Head() eth.L2BlockRef {
 // resolveVerifiedAsSafe handles the Verified branch of SafeL2Head.
 func (e *EngineController) resolveVerifiedAsSafe(block eth.BlockID) eth.L2BlockRef {
 	if block.Number > e.localSafeHead.Number {
-		e.log.Warn("super authority safe head ahead of local safe head, using local safe", "super_authority_safe", block, "local_safe", e.localSafeHead)
-		return e.localSafeHead
+		// Local-safe fell behind the verified head, usually after an L1 reorg.
+		// The current local-safe blocks have not passed cross-chain
+		// verification, so they must not receive the safe label.
+		e.metrics.RecordSuperAuthorityReorgSignal("ahead_of_local_safe")
+		e.log.Warn("super authority safe head ahead of local safe head",
+			"super_authority_safe", block, "local_safe", e.localSafeHead)
+		return e.crossSafeFallback("ahead-of-local-safe")
 	}
 	br, err := e.engine.L2BlockRefByHash(e.ctx, block.Hash)
 	if err != nil {
@@ -283,6 +288,7 @@ func (e *EngineController) resolveAnchorAsSafe(ts uint64) eth.L2BlockRef {
 	}
 	if br.Number > e.localSafeHead.Number {
 		// Local safe hasn't reached the anchor block for the validator, so use local safe head.
+		// Before activation no block is cross-verified, so local-safe is the correct bound.
 		return e.localSafeHead
 	}
 	e.crossSafeCache.Store(br)
@@ -843,14 +849,16 @@ func (e *EngineController) insertUnsafePayload(ctx context.Context, envelope *et
 		if err != nil {
 			return err
 		}
-		fc.SafeBlockHash = safeRef.Hash
 		fc.FinalizedBlockHash = finalizedRef.Hash
 		e.SetUnsafeHead(ref)
 		e.emitter.Emit(ctx, UnsafeUpdateEvent{Ref: ref})
 		e.SetLocalSafeHead(safeRef)
 		e.SetDeprecatedSafeHead(safeRef)
-		e.onSafeUpdate(ctx, safeRef, safeRef)
 		e.SetFinalizedHead(finalizedRef)
+		// safeRef is only local-safe; SafeL2Head bounds it by the verified head.
+		crossSafe := e.SafeL2Head()
+		fc.SafeBlockHash = crossSafe.Hash
+		e.onSafeUpdate(ctx, crossSafe, safeRef)
 	}
 	logFn := e.logSyncProgressMaybe()
 	defer logFn()

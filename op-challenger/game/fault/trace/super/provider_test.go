@@ -10,10 +10,10 @@ import (
 	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/types"
 	types2 "github.com/ethereum-optimism/optimism/op-challenger/game/types"
 	"github.com/ethereum-optimism/optimism/op-service/eth"
+	"github.com/ethereum-optimism/optimism/op-service/log"
 	"github.com/ethereum-optimism/optimism/op-service/testlog"
 	"github.com/ethereum-optimism/optimism/op-service/testutils"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/log"
 	"github.com/stretchr/testify/require"
 )
 
@@ -319,6 +319,7 @@ func TestSuperNodeProvider_Get(t *testing.T) {
 		stubSuperNode.Add(response)
 		_, err := provider.Get(context.Background(), types.RootPosition)
 		require.ErrorIs(t, err, types2.ErrNotInSync)
+		require.ErrorContains(t, err, "super root source (superroot_atTimestamp)", "should identify which node is behind")
 	})
 
 	t.Run("PreviousSuperRootNotInSync", func(t *testing.T) {

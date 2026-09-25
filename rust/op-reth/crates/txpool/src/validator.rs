@@ -343,7 +343,7 @@ where
     }
 }
 
-/// UPSTREAM-MIRROR(delegate): reth@rev:480216f
+/// UPSTREAM-MIRROR(delegate): reth@rev:092cb23
 /// `reth_transaction_pool::validate::EthTransactionValidator`
 ///
 /// Wraps the Ethereum validator. Re-check newly defaulted batch methods and upstream overrides;

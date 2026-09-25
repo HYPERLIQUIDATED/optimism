@@ -981,7 +981,7 @@ impl OpProofsStore for MdbxProofsStorage {
     }
 }
 
-/// UPSTREAM-MIRROR(copy): reth@rev:480216f `reth_db::database_metrics::DatabaseMetrics`
+/// UPSTREAM-MIRROR(copy): reth@rev:092cb23 `reth_db::database_metrics::DatabaseMetrics`
 ///
 /// This implementation is copied from the
 /// [`DatabaseMetrics`](reth_db::database_metrics::DatabaseMetrics) implementation for
