@@ -268,7 +268,20 @@ async fn launch_fixture_node(
     args: RollupArgs,
 ) -> eyre::Result<()> {
     if !args.proofs_history {
-        let handle = builder.node(FixtureOpNode::new(args)).launch().await?;
+        let handle = builder
+            .node(FixtureOpNode::new(args))
+            .extend_rpc_modules(|ctx| {
+                if ctx.registry.eth_api().pending_block_rx().is_some() {
+                    ctx.modules.merge_ipc(
+                        reth_optimism_rpc::execution_receipts::execution_receipts_rpc(
+                            ctx.registry.eth_api().clone(),
+                        )?,
+                    )?;
+                }
+                Ok(())
+            })
+            .launch()
+            .await?;
         return handle.node_exit_future.await;
     }
 
@@ -325,6 +338,13 @@ where
                 .boxed())
         })
         .extend_rpc_modules(move |ctx| {
+            if ctx.registry.eth_api().pending_block_rx().is_some() {
+                ctx.modules.merge_ipc(
+                    reth_optimism_rpc::execution_receipts::execution_receipts_rpc(
+                        ctx.registry.eth_api().clone(),
+                    )?,
+                )?;
+            }
             info!(target: "reth::cli", "Installing proofs-history RPC overrides (eth_getProof, debug_executePayload)");
             let api_ext = EthApiExt::new(ctx.registry.eth_api().clone(), storage.clone());
             let auth_api_ext = EthApiExt::new(ctx.registry.eth_api().clone(), storage.clone());

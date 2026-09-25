@@ -81,6 +81,11 @@ impl FlashBlockPendingSequence {
         self.block_broadcaster.subscribe()
     }
 
+    /// Whether every index from zero through the latest received index is present.
+    pub(crate) fn is_contiguous(&self) -> bool {
+        !self.inner.is_empty() && self.inner.keys().copied().eq(0..self.inner.len() as u64)
+    }
+
     /// Returns whether this flashblock would be accepted into the current sequence.
     pub fn can_accept(&self, flashblock: &FlashBlock) -> bool {
         if flashblock.index == 0 {

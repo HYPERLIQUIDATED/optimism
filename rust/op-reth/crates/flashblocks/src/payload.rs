@@ -25,6 +25,8 @@ pub struct PendingFlashBlock<N: NodePrimitives> {
     pub last_flashblock_hash: B256,
     /// Whether the [`PendingBlock`] has a properly computed stateroot.
     pub has_computed_state_root: bool,
+    /// Service-local publication sequence; zero until accepted for publication.
+    pub publication_id: u64,
 }
 
 impl<N: NodePrimitives> PendingFlashBlock<N> {
@@ -42,6 +44,7 @@ impl<N: NodePrimitives> PendingFlashBlock<N> {
             last_flashblock_index,
             last_flashblock_hash,
             has_computed_state_root,
+            publication_id: 0,
         }
     }
 

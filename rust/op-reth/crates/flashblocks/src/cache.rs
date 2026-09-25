@@ -444,7 +444,7 @@ impl<T: SignedTransaction> SequenceManager<T> {
         // cached_state, source_name, pending_parent)
         let (ticket, base, last_flashblock, transactions, cached_state, source_name, pending_parent) =
             // Priority 1: Try current pending sequence (canonical mode)
-            if let Some(base) = self.pending.sequence.payload_base().filter(|b| b.parent_hash == local_tip_hash) {
+            if let Some(base) = self.pending.sequence.payload_base().filter(|b| b.parent_hash == local_tip_hash && self.pending.sequence.is_contiguous()) {
                 let revision = self.pending.revision();
                 if self.pending.is_revision_applied(revision) {
                     trace!(
@@ -476,7 +476,7 @@ impl<T: SignedTransaction> SequenceManager<T> {
             // Priority 3: Try speculative building with pending parent state
             else if let Some(ref pending_state) = pending_parent_state {
                 // Check if pending sequence's parent matches the pending state's block
-                if let Some(base) = self.pending.sequence.payload_base().filter(|b| b.parent_hash == pending_state.block_hash) {
+                if let Some(base) = self.pending.sequence.payload_base().filter(|b| b.parent_hash == pending_state.block_hash && self.pending.sequence.is_contiguous()) {
                     let revision = self.pending.revision();
                     if self.pending.is_revision_applied(revision) {
                         trace!(
@@ -1007,6 +1007,27 @@ mod tests {
             manager.next_buildable_args::<OpPrimitives>(parent, 1_000_000, None).unwrap();
         assert_eq!(candidate.base.block_number, 101);
         assert_eq!(candidate.last_flashblock_index, 1);
+    }
+
+    #[test]
+    fn missing_middle_index_is_not_buildable() {
+        let factory = TestFlashBlockFactory::new();
+        let mut manager: SequenceManager<OpTxEnvelope> = SequenceManager::new(true);
+        let zero = factory.flashblock_at(0).build();
+        let parent = zero.base.as_ref().unwrap().parent_hash;
+        let one = factory.flashblock_after(&zero).build();
+        let two = factory.flashblock_after(&one).build();
+        manager.insert_flashblock(zero).unwrap();
+        manager.insert_flashblock(two).unwrap();
+        assert!(manager.next_buildable_args::<OpPrimitives>(parent, 1_000_000, None).is_none());
+        manager.insert_flashblock(one).unwrap();
+        assert_eq!(
+            manager
+                .next_buildable_args::<OpPrimitives>(parent, 1_000_000, None)
+                .unwrap()
+                .last_flashblock_index,
+            2
+        );
     }
 
     #[test]

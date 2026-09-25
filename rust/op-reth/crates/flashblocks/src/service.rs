@@ -23,7 +23,7 @@ use std::{
 };
 use tokio::{
     sync::{broadcast, mpsc, oneshot, watch},
-    time::sleep,
+    time::sleep_until,
 };
 use tracing::*;
 
@@ -68,6 +68,9 @@ pub struct FlashBlockService<
     in_progress_tx: watch::Sender<Option<FlashBlockBuildInfo>>,
     /// Broadcast channel to forward received flashblocks from the subscription.
     received_flashblocks_tx: tokio::sync::broadcast::Sender<Arc<FlashBlock>>,
+
+    /// Ordered notifications emitted after the RPC pending state has been updated.
+    published_blocks: broadcast::Sender<Arc<PendingFlashBlock<N>>>,
 
     /// Executes flashblock sequences to build pending blocks.
     builder: FlashBlockBuilder<EvmConfig, Provider>,
@@ -129,6 +132,7 @@ where
             canonical_state_rx: None,
             in_progress_tx,
             received_flashblocks_tx,
+            published_blocks: broadcast::channel(64).0,
             builder: FlashBlockBuilder::new(evm_config, provider),
             spawner,
             job: None,
@@ -184,6 +188,11 @@ where
         &self.received_flashblocks_tx
     }
 
+    /// Returns successful publication events, without coalescing intermediate builds.
+    pub const fn publications(&self) -> &broadcast::Sender<Arc<PendingFlashBlock<N>>> {
+        &self.published_blocks
+    }
+
     /// Returns the sender half for the flashblock sequence broadcast channel.
     pub const fn block_sequence_broadcaster(
         &self,
@@ -211,6 +220,8 @@ where
     ///
     /// Note: this should be spawned
     pub async fn run(mut self, tx: watch::Sender<Option<PendingFlashBlock<N>>>) {
+        let mut retry_at: Option<Instant> = None;
+        let mut publication_id = 0_u64;
         loop {
             tokio::select! {
                 // Event 1: job exists, listen to job results
@@ -258,18 +269,24 @@ where
 
                     match result {
                         Ok(Some(build_result)) => {
-                            let pending = build_result.pending_flashblock;
+                            let mut pending = build_result.pending_flashblock;
                             let apply_outcome = self.sequences
                                 .on_build_complete(job.ticket, Some((pending.clone(), build_result.cached_reads)));
 
                             if apply_outcome.is_applied() {
+                                publication_id += 1;
+                                pending.publication_id = publication_id;
                                 // Record pending state for speculative building of subsequent blocks
                                 self.pending_states.record_build(build_result.pending_state);
 
                                 let elapsed = job.start_time.elapsed();
                                 self.metrics.execution_duration.record(elapsed.as_secs_f64());
 
-                                let _ = tx.send(Some(pending));
+                                let publication = (self.published_blocks.receiver_count() > 0)
+                                    .then(|| Arc::new(pending.clone()));
+                                if tx.send(Some(pending)).is_ok() && let Some(publication) = publication {
+                                    let _ = self.published_blocks.send(publication);
+                                }
                             } else {
                                 match apply_outcome {
                                     BuildApplyOutcome::RejectedPendingSequenceMismatch { .. } => {
@@ -316,7 +333,12 @@ where
                 }
 
                 // Event 2: New flashblock arrives (batch process all ready flashblocks)
-                result = self.incoming_flashblock_rx.next() => {
+                result = async {
+                    if let Some(deadline) = retry_at && deadline > Instant::now() {
+                        sleep_until(deadline.into()).await;
+                    }
+                    self.incoming_flashblock_rx.next().await
+                } => {
                     match result {
                         Some(Ok(flashblock)) => {
                             // Process first flashblock
@@ -326,7 +348,11 @@ where
                             while let Some(result) = self.incoming_flashblock_rx.next().now_or_never().flatten() {
                                 match result {
                                     Ok(fb) => self.process_flashblock(fb),
-                                    Err(err) => warn!(target: "flashblocks", %err, "Error receiving flashblock"),
+                                    Err(err) => {
+                                        warn!(target: "flashblocks", %err, "Error receiving flashblock");
+                                        retry_at = Some(Instant::now() + CONNECTION_BACKOUT_PERIOD);
+                                        break;
+                                    },
                                 }
                             }
 
@@ -339,7 +365,7 @@ where
                                 retry_period = CONNECTION_BACKOUT_PERIOD.as_secs(),
                                 "Error receiving flashblock"
                             );
-                            sleep(CONNECTION_BACKOUT_PERIOD).await;
+                            retry_at = Some(Instant::now() + CONNECTION_BACKOUT_PERIOD);
                         }
                         None => {
                             warn!(target: "flashblocks", "Flashblock stream ended");
@@ -595,7 +621,7 @@ mod tests {
     type Provider = MockEthProvider<OpPrimitives, Arc<OpChainSpec>>;
     type TestService = FlashBlockService<
         OpPrimitives,
-        stream::Pending<eyre::Result<FlashBlock>>,
+        stream::BoxStream<'static, eyre::Result<FlashBlock>>,
         OpEvmConfig,
         Provider,
     >;
@@ -621,7 +647,7 @@ mod tests {
             Vec::new(),
         );
         let mut service = FlashBlockService::new(
-            stream::pending(),
+            stream::pending().boxed(),
             OpEvmConfig::optimism(OP_MAINNET.clone()),
             provider.clone(),
             TaskExecutor::test(),
@@ -689,6 +715,41 @@ mod tests {
         assert_eq!(pending.block().number(), parent.number() + 1);
         assert_eq!(pending.block().parent_hash(), parent.hash());
     }
+    #[tokio::test]
+    async fn reconnect_backoff_does_not_delay_parent_wakeup_or_publication() {
+        let (mut service, provider, parent) = waiting_service(false);
+        let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = seen.clone();
+        service.incoming_flashblock_rx = stream::once(async move {
+            observed.store(true, std::sync::atomic::Ordering::Relaxed);
+            Err(eyre::eyre!("injected connection reset"))
+        })
+        .chain(stream::pending())
+        .boxed();
+        let mut publications = service.publications().subscribe();
+        let (canonical_tx, canonical_rx) = broadcast::channel(1);
+        service = service.with_canonical_state_rx(canonical_rx);
+        let (pending_tx, pending_rx) = watch::channel(None);
+        let run = service.run(pending_tx);
+        tokio::pin!(run);
+        assert!(run.as_mut().now_or_never().is_none());
+        assert!(seen.load(std::sync::atomic::Ordering::Relaxed));
+        provider.add_block(parent.hash(), parent.clone().into_block());
+        canonical_tx.send(commit(vec![parent.clone()])).unwrap();
+        let publication = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                () = &mut run => panic!("service stopped before publishing"),
+                event = publications.recv() => event.unwrap(),
+            }
+        })
+        .await
+        .expect("publication must not wait for the five-second reconnect delay");
+        let readable = pending_rx.borrow();
+        assert!(publication.publication_id > 0);
+        assert_eq!(readable.as_ref().unwrap().publication_id, publication.publication_id);
+        assert_eq!(publication.block().parent_hash(), parent.hash());
+    }
+
     #[tokio::test]
     async fn canonical_receiver_close_does_not_spin() {
         let provider = MockEthProvider::<OpPrimitives>::new()

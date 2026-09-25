@@ -27,3 +27,6 @@ pub use error::{OpEthApiError, OpInvalidTransactionError, SequencerClientError};
 pub use eth::{OpEthApi, OpEthApiBuilder, OpReceiptBuilder};
 pub use metrics::{EthApiExtMetrics, SequencerMetrics};
 pub use sequencer::SequencerClient;
+
+/// Ordered IPC receipts from pending execution and canonical repair.
+pub mod execution_receipts;

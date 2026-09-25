@@ -125,6 +125,13 @@ impl<N: RpcNodeCore, Rpc: RpcConvert> OpEthApi<N, Rpc> {
         self.inner.flashblocks.as_ref().map(|f| f.pending_block_rx.clone())
     }
 
+    /// Subscribes to every successful pending publication. Consumers must handle lag explicitly.
+    pub fn subscribe_published_blocks(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<Arc<PendingFlashBlock<N::Primitives>>>> {
+        self.inner.flashblocks.as_ref().map(|f| f.published_blocks.subscribe())
+    }
+
     /// Returns a new subscription to received flashblocks.
     pub fn subscribe_received_flashblocks(&self) -> Option<FlashBlockRx> {
         self.inner.flashblocks.as_ref().map(|f| f.received_flashblocks.subscribe())
@@ -627,6 +634,7 @@ where
             let flashblocks_sequence = service.block_sequence_broadcaster().clone();
             let received_flashblocks = service.flashblocks_broadcaster().clone();
             let in_progress_rx = service.subscribe_in_progress();
+            let published_blocks = service.publications().clone();
             ctx.components.task_executor().spawn_task(Box::pin(service.run(tx)));
 
             if flashblock_consensus {
@@ -643,6 +651,7 @@ where
                 flashblocks_sequence,
                 in_progress_rx,
                 received_flashblocks,
+                published_blocks,
             ))
         } else {
             None

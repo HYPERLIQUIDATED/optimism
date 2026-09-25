@@ -78,6 +78,8 @@ pub type InProgressFlashBlockRx = tokio::sync::watch::Receiver<Option<FlashBlock
 pub struct FlashblocksListeners<N: NodePrimitives> {
     /// Receiver of the most recent executed [`PendingFlashBlock`] built out of [`FlashBlock`]s.
     pub pending_block_rx: PendingBlockRx<N>,
+    /// Ordered successful publications; lag must be handled explicitly by consumers.
+    pub published_blocks: tokio::sync::broadcast::Sender<Arc<PendingFlashBlock<N>>>,
     /// Subscription channel of the complete sequences of [`FlashBlock`]s built.
     pub flashblocks_sequence: tokio::sync::broadcast::Sender<FlashBlockCompleteSequence>,
     /// Receiver that signals whether a [`FlashBlock`] is currently being built.
@@ -93,7 +95,14 @@ impl<N: NodePrimitives> FlashblocksListeners<N> {
         flashblocks_sequence: tokio::sync::broadcast::Sender<FlashBlockCompleteSequence>,
         in_progress_rx: InProgressFlashBlockRx,
         received_flashblocks: tokio::sync::broadcast::Sender<Arc<FlashBlock>>,
+        published_blocks: tokio::sync::broadcast::Sender<Arc<PendingFlashBlock<N>>>,
     ) -> Self {
-        Self { pending_block_rx, flashblocks_sequence, in_progress_rx, received_flashblocks }
+        Self {
+            pending_block_rx,
+            flashblocks_sequence,
+            in_progress_rx,
+            received_flashblocks,
+            published_blocks,
+        }
     }
 }
