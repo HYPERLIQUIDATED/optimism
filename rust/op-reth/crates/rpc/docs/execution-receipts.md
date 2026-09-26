@@ -92,6 +92,11 @@ the same batch. A child can be emitted earlier only if the delivered parent's lo
 header hash matches the child's parent hash. Its later parent seal does not replay or rewind the
 child. A consecutive set of Flashblocks indices alone does not certify a complete parent.
 Readable canonical parents are fetched directly instead of waiting for their event notification.
+If a canonical notification skips heights after database backfill, the subscription reads and
+publishes the missing blocks in order before processing that notification. Recovery reads one block
+at a time and checks the current canonical anchor and successor hashes before and after each read.
+Previously delivered pending receipts are reconciled through the same apply/seal rules, so only
+the missing suffix is sent. Duplicate notifications after recovery do not replay those receipts.
 
 Track canonical confirmation separately from the latest applied pending position. If later pending
 effects are already in memory, a seal does not make that entire memory state a snapshot of the sealed
@@ -114,6 +119,13 @@ canonical reorg, input-stream lag or closure, and buffer limits. Stop using affe
 trading. Delivery of a reset is best-effort if the connection is unwritable or already disconnected.
 An unexpected sequence, changed session, or subscription termination also requires reconciliation.
 
+Canonical recovery stops if the anchor changes, a required block or receipts are unavailable, or
+the gap exceeds 1,024 blocks. `canonical_gap` and `canonical_parent_mismatch` distinguish a skipped
+height from a conflicting parent. Resets also include a diagnostic `context` with the current
+`anchor`, `lastCanonicalInput`, `queuedCanonical`, and `repairTarget`; unavailable values are null.
+The canonical inputs include block number, block hash, and parent hash. The same context is logged
+with the session and sequence. These fields describe where processing stopped, not a resume cursor.
+
 The server retains no session replay and accepts no resume cursor. On reconnect, subscribe again
 and buffer the new stream in a bounded queue. Its anchor may have advanced past previously delivered
 pending receipts; fetch complete historical receipts to bridge that gap.
@@ -135,6 +147,9 @@ coalescing messages. Each subscription retains at most 64 pending block snapshot
 block-and-receipt memory budget, excluding transport and serialization buffers. Socket enqueue has
 a 2-second timeout. Slow consumers do not block Flashblocks execution. IPC message-size and connection
 limits also apply. Use a private, permission-controlled IPC socket.
+Queued canonical input has a separate 64 MiB budget and a 1,024-block limit. Missing recovery blocks
+are read and sent individually rather than retained as an entire range. Recovery remains subject to
+the input-stream lag checks and socket timeout.
 
 Unsubscribe normally:
 

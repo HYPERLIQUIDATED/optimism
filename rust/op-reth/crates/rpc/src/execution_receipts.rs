@@ -13,11 +13,13 @@ use reth_optimism_primitives::OpPrimitives;
 use reth_primitives_traits::{InMemorySize, Recovered, TransactionMeta};
 use reth_rpc_eth_api::{EthApiTypes, RpcConvert, RpcNodeCore, transaction::ConvertReceiptInput};
 use reth_rpc_eth_types::block::BlockAndReceipts;
-use reth_storage_api::{BlockReader, BlockReaderIdExt, ReceiptProvider, TransactionVariant};
+use reth_storage_api::{
+    BlockHashReader, BlockReader, BlockReaderIdExt, ReceiptProvider, TransactionVariant,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -28,6 +30,7 @@ use tokio::sync::broadcast;
 
 const MAX_BLOCKS: usize = 64;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RECOVERY_BLOCKS: u64 = 1024;
 const SEND_TIMEOUT: Duration = Duration::from_secs(2);
 static SESSIONS: AtomicU64 = AtomicU64::new(1);
 
@@ -126,6 +129,22 @@ impl ReceiptSequence {
         Self { anchor, emitted: BTreeMap::new(), waiting: BTreeMap::new() }
     }
 
+    fn needs_recovery(
+        &self,
+        next_canonical: Option<&Snapshot>,
+        pending_target: Option<u64>,
+    ) -> Result<bool, &'static str> {
+        let target = next_canonical
+            .map_or(pending_target, |snapshot| snapshot.number().checked_sub(1))
+            .unwrap_or(self.anchor.number);
+        let missing = target.saturating_sub(self.anchor.number);
+
+        if missing > MAX_RECOVERY_BLOCKS {
+            return Err("canonical_recovery_limit");
+        }
+        Ok(missing != 0)
+    }
+
     fn pending(&mut self, snapshot: Snapshot) -> Result<Vec<Event<Delta>>, &'static str> {
         snapshot.validate()?;
         let number = snapshot.number();
@@ -154,8 +173,11 @@ impl ReceiptSequence {
             }
             return Ok(Vec::new());
         }
-        if number != self.anchor.number + 1 || snapshot.parent() != self.anchor.hash {
-            return Err("canonical_gap_or_reorg");
+        if number != self.anchor.number + 1 {
+            return Err("canonical_gap");
+        }
+        if snapshot.parent() != self.anchor.hash {
+            return Err("canonical_parent_mismatch");
         }
         let mut deltas = Vec::new();
         let mut start = 0;
@@ -241,6 +263,50 @@ impl ReceiptSequence {
         }
         Ok(())
     }
+}
+
+/// Read one canonical successor without retaining the entire recovery range.
+/// Receipt counts and memory bounds are checked when the sequence accepts the snapshot.
+fn read_canonical_successor(
+    anchor: BlockNumHash,
+    mut read_hash: impl FnMut(u64) -> eyre::Result<Option<B256>>,
+    read_snapshot: impl FnOnce(B256) -> eyre::Result<Snapshot>,
+) -> eyre::Result<Option<Snapshot>> {
+    let hash =
+        read_hash(anchor.number)?.ok_or_else(|| eyre::eyre!("canonical_anchor_unavailable"))?;
+    if hash != anchor.hash {
+        tracing::warn!(target: "rpc::execution_receipts", block = anchor.number,
+            expected_hash = %anchor.hash, actual_hash = %hash, "Canonical recovery anchor changed");
+        eyre::bail!("canonical_anchor_changed");
+    }
+
+    let Some(number) = anchor.number.checked_add(1) else {
+        eyre::bail!("canonical_height_overflow");
+    };
+    let Some(hash) = read_hash(number)? else { return Ok(None) };
+    let snapshot = read_snapshot(hash)?;
+
+    // Hash-based reads keep the block and its receipts together. Recheck canonical membership
+    // after the reads in case the provider changed branches while recovery was in progress.
+    let current_anchor = read_hash(anchor.number)?;
+    if current_anchor != Some(anchor.hash) {
+        tracing::warn!(target: "rpc::execution_receipts", block = anchor.number,
+            expected_hash = %anchor.hash, actual_hash = ?current_anchor, "Canonical recovery anchor changed during read");
+        eyre::bail!("canonical_anchor_changed");
+    }
+    let current_hash = read_hash(number)?;
+    if current_hash != Some(hash) {
+        tracing::warn!(target: "rpc::execution_receipts", block = number,
+            expected_hash = %hash, actual_hash = ?current_hash, "Canonical recovery successor changed during read");
+        eyre::bail!("canonical_successor_changed");
+    }
+    if snapshot.number() != number || snapshot.hash() != hash || snapshot.parent() != anchor.hash {
+        tracing::warn!(target: "rpc::execution_receipts", expected_number = number, expected_hash = %hash,
+            expected_parent = %anchor.hash, actual_number = snapshot.number(), actual_hash = %snapshot.hash(),
+            actual_parent = %snapshot.parent(), "Canonical recovery successor does not extend anchor");
+        eyre::bail!("canonical_parent_mismatch");
+    }
+    Ok(Some(snapshot))
 }
 
 #[derive(Serialize)]
@@ -348,6 +414,9 @@ where
                 let session = format!("{}-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(), SESSIONS.fetch_add(1, Ordering::Relaxed));
                 let mut sequence = 0_u64;
                 let mut state = ReceiptSequence::new(anchor);
+                let mut canonical_blocks = VecDeque::<Snapshot>::new();
+                let mut repair_to = None;
+                let mut canonical_input = None;
                 let spec = eth.provider().chain_spec();
                 let ready = json!({
                     "type":"ready", "sessionId":session, "sequence":sequence,
@@ -357,54 +426,73 @@ where
                 if sink.send_timeout(ready, SEND_TIMEOUT).await.is_err() { return Ok(()); }
                 let result: Result<(), String> = async {
                     loop {
-                        let mut deltas;
-                        if let Some(pending) = first.take() {
-                            deltas = state.pending(pending)?;
+                        let deltas;
+                        // Keep a jumped notification queued until its predecessors have been
+                        // applied and sent. Each iteration reads at most one missing block.
+                        if let Some(snapshot) = canonical_blocks.front() {
+                            canonical_input = Some((snapshot.number(), snapshot.hash(), snapshot.parent()));
+                        }
+                        if state.needs_recovery(canonical_blocks.front(), repair_to)? {
+                            let required = !canonical_blocks.is_empty();
+                            let provider = eth.provider().clone();
+                            let anchor = state.anchor;
+                            let snapshot = tokio::task::spawn_blocking(move || {
+                                // Pending publications may precede execution of their parent.
+                                if !required && provider.latest_header()?.is_none_or(|head| head.number() <= anchor.number) {
+                                    return Ok(None);
+                                }
+                                read_canonical_successor(anchor, |number| Ok(provider.block_hash(number)?), |hash| {
+                                    let block = provider.recovered_block(hash.into(), TransactionVariant::WithHash)?
+                                        .ok_or_else(|| eyre::eyre!("canonical_block_unavailable"))?;
+                                    let receipts = provider.receipts_by_block(hash.into())?
+                                        .ok_or_else(|| eyre::eyre!("canonical_receipts_unavailable"))?;
+                                    Ok(Snapshot { data: BlockAndReceipts::new(Arc::new(block), Arc::new(receipts)),
+                                        canonical: true, computed_hash: true, publication_id: 0 })
+                                })
+                            }).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+                            let Some(snapshot) = snapshot else {
+                                if required { return Err("canonical_block_unavailable".into()); }
+                                // A pending child can precede its canonical parent. Wait for a
+                                // new input rather than polling the database in a tight loop.
+                                repair_to = None;
+                                continue;
+                            };
+                            canonical_input = Some((snapshot.number(), snapshot.hash(), snapshot.parent()));
+                            deltas = state.canonical(snapshot)?;
+                        } else if let Some(snapshot) = canonical_blocks.pop_front() {
+                            deltas = state.canonical(snapshot)?;
                         } else {
-                            tokio::select! {
+                            let pending = if let Some(pending) = first.take() {
+                                pending
+                            } else { tokio::select! {
                                 _ = sink.closed() => return Ok(()),
                                 event = publications.recv() => {
                                     let pending = event.map_err(|e| match e {
                                         broadcast::error::RecvError::Lagged(_) => "publication_gap",
                                         broadcast::error::RecvError::Closed => "publication_stream_closed",
                                     })?;
-                                    deltas = state.pending(Snapshot::pending(&pending))?;
+                                    Snapshot::pending(&pending)
                                 }
                                 event = canonical.recv() => {
                                     let event = event.map_err(|_| "canonical_stream_gap")?;
                                     if event.reverted().is_some() { return Err("canonical_reorg".into()); }
-                                    deltas = Vec::new();
+                                    let mut bytes = 0;
                                     for (block, receipts) in event.committed().blocks_and_receipts() {
                                         let snapshot = Snapshot { data: BlockAndReceipts::new(block.clone(), Arc::new(receipts.clone())),
                                             canonical: true, computed_hash: true, publication_id: 0 };
-                                        deltas.extend(state.canonical(snapshot)?);
+                                        bytes += snapshot.bytes();
+                                        if canonical_blocks.len() >= MAX_RECOVERY_BLOCKS as usize || bytes > MAX_BYTES {
+                                            return Err("buffer_limit".into());
+                                        }
+                                        canonical_blocks.push_back(snapshot);
                                     }
+                                    continue;
                                 }
-                            }
-                        }
-                        // A canonical parent can already be readable before its notification is
-                        // delivered. Repair now instead of waiting for another subscription event.
-                        if let Some((&waiting, _)) = state.waiting.last_key_value() {
-                            let from = state.anchor.number + 1;
-                            let to = waiting.saturating_sub(1);
-                            if to >= from {
-                                if to - from >= MAX_BLOCKS as u64 { return Err("buffer_limit".into()); }
-                                let provider = eth.provider().clone();
-                                let blocks = tokio::task::spawn_blocking(move || -> eyre::Result<Vec<Snapshot>> {
-                                    let Some(head) = provider.latest_header()? else { return Ok(Vec::new()); };
-                                    let mut blocks = Vec::new();
-                                    for number in from..=to.min(head.number()) {
-                                        let block = provider.recovered_block(number.into(), TransactionVariant::WithHash)?
-                                            .ok_or_else(|| eyre::eyre!("canonical block unavailable"))?;
-                                        let receipts = provider.receipts_by_block(block.hash().into())?
-                                            .ok_or_else(|| eyre::eyre!("canonical receipts unavailable"))?;
-                                        blocks.push(Snapshot { data: BlockAndReceipts::new(Arc::new(block), Arc::new(receipts)),
-                                            canonical: true, computed_hash: true, publication_id: 0 });
-                                    }
-                                    Ok(blocks)
-                                }).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
-                                for block in blocks { deltas.extend(state.canonical(block)?); }
-                            }
+                            }};
+                            deltas = state.pending(pending)?;
+                            // Readable canonical parents need not wait for their notification.
+                            repair_to = state.waiting.last_key_value()
+                                .map(|(&number, _)| number.saturating_sub(1));
                         }
                         if deltas.is_empty() { continue; }
                         let converter_eth = eth.clone();
@@ -430,12 +518,24 @@ where
                 }.await;
                 if let Err(reason) = result {
                     sequence += 1;
+                    let context = json!({
+                        "anchor":{"blockNumber":state.anchor.number,"blockHash":state.anchor.hash},
+                        "lastCanonicalInput":canonical_input.map(|(number, hash, parent)| json!({
+                            "blockNumber":number,"blockHash":hash,"parentHash":parent})),
+                        "queuedCanonical":canonical_blocks.front().map(|snapshot| json!({
+                            "blockNumber":snapshot.number(),"blockHash":snapshot.hash(),"parentHash":snapshot.parent()})),
+                        "repairTarget":canonical_blocks.front()
+                            .and_then(|snapshot| snapshot.number().checked_sub(1))
+                            .or(repair_to).filter(|&to| to > state.anchor.number),
+                    });
+                    tracing::warn!(target: "rpc::execution_receipts", %session, sequence, %reason, %context, "Receipt subscription reset");
                     // Release snapshots and input queues before waiting for a slow reader. A
                     // terminal reset must not be silently discarded while IPC remains connected.
                     drop(state);
                     drop(publications);
                     drop(canonical);
-                    let reset = json!({"type":"reset", "sessionId":session, "sequence":sequence, "reason":reason});
+                    drop(canonical_blocks);
+                    let reset = json!({"type":"reset", "sessionId":session, "sequence":sequence, "reason":reason, "context":context});
                     if let Ok(message) = SubscriptionMessage::new(sink.method_name(), sink.subscription_id(), &reset) {
                         tokio::select! {
                             _ = sink.closed() => {},
@@ -635,8 +735,184 @@ mod tests {
         );
         assert_eq!(
             s.canonical(snapshot(100, B256::repeat_byte(1), &[], 0, true)).unwrap_err(),
-            "canonical_gap_or_reorg"
+            "canonical_parent_mismatch"
         );
+    }
+
+    fn read_from_blocks(
+        blocks: &[Snapshot],
+        anchor: BlockNumHash,
+    ) -> eyre::Result<Option<Snapshot>> {
+        read_canonical_successor(
+            anchor,
+            |number| Ok(blocks.iter().find(|b| b.number() == number).map(Snapshot::hash)),
+            |hash| {
+                blocks
+                    .iter()
+                    .find(|b| b.hash() == hash)
+                    .cloned()
+                    .ok_or_else(|| eyre::eyre!("canonical_block_unavailable"))
+            },
+        )
+    }
+
+    #[test]
+    fn backfill_gap_larger_than_pending_buffer_preserves_receipt_order() {
+        let anchor = snapshot(99, B256::ZERO, &[], 0, true);
+        let mut state = ReceiptSequence::new(BlockNumHash::new(99, anchor.hash()));
+        let mut parent = anchor.hash();
+        let mut blocks = Vec::new();
+        for number in 100..=168 {
+            let block = snapshot(number, parent, &[number, number + 1], 0, true);
+            parent = block.hash();
+            blocks.push(block);
+        }
+
+        // One transaction of the first block and a pending child are already known.
+        let mut events = state.pending(snapshot(100, anchor.hash(), &[100], 1, false)).unwrap();
+        assert!(
+            state.pending(snapshot(101, blocks[0].hash(), &[101], 2, false)).unwrap().is_empty()
+        );
+        let notification = blocks.last().unwrap().clone();
+        let stored = std::iter::once(anchor).chain(blocks.iter().cloned()).collect::<Vec<_>>();
+        assert_eq!(state.canonical(notification.clone()).unwrap_err(), "canonical_gap");
+
+        // Canonical input skips 68 predecessors, as happens when backfill writes straight to DB.
+        while state.needs_recovery(Some(&notification), None).unwrap() {
+            let next = read_from_blocks(&stored, state.anchor).unwrap().unwrap();
+            assert_eq!(next.number(), state.anchor.number + 1);
+            events.extend(state.canonical(next).unwrap());
+        }
+        events.extend(state.canonical(notification).unwrap());
+
+        let mut receipts = Vec::new();
+        let mut seals = Vec::new();
+        for event in &events {
+            match event {
+                Event::Apply(delta) => receipts.extend(
+                    (delta.start..delta.snapshot.len()).map(|i| (delta.snapshot.number(), i)),
+                ),
+                Event::Seal(seal) => {
+                    assert_eq!(receipts.iter().filter(|(n, _)| *n == seal.block_number).count(), 2);
+                    seals.push(seal.block_number);
+                }
+            }
+        }
+        assert_eq!(receipts, (100..=168).flat_map(|n| [(n, 0), (n, 1)]).collect::<Vec<_>>());
+        assert_eq!(seals, (100..=168).collect::<Vec<_>>());
+        // Delayed canonical notifications and stale pending data cannot replay anything.
+        for block in blocks {
+            assert!(state.canonical(block).unwrap().is_empty());
+        }
+        assert!(state.pending(snapshot(101, B256::ZERO, &[999], 3, false)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recovery_rejects_changed_anchor_and_disconnected_successor() {
+        let anchor = snapshot(99, B256::ZERO, &[], 0, true);
+        assert_eq!(
+            read_from_blocks(std::slice::from_ref(&anchor), BlockNumHash::new(99, B256::ZERO))
+                .unwrap_err()
+                .to_string(),
+            "canonical_anchor_changed"
+        );
+
+        let position = BlockNumHash::new(99, anchor.hash());
+        assert!(read_from_blocks(std::slice::from_ref(&anchor), position).unwrap().is_none());
+        let next = snapshot(100, B256::repeat_byte(1), &[], 0, true);
+        assert_eq!(
+            read_from_blocks(&[anchor, next], position).unwrap_err().to_string(),
+            "canonical_parent_mismatch"
+        );
+    }
+
+    #[test]
+    fn recovery_requires_block_and_receipts_and_checks_pending_execution() {
+        let anchor = snapshot(99, B256::ZERO, &[], 0, true);
+        let position = BlockNumHash::new(99, anchor.hash());
+        let next = snapshot(100, anchor.hash(), &[1, 2], 0, true);
+        let hashes = |n| Ok(Some(if n == 99 { anchor.hash() } else { next.hash() }));
+        for reason in ["canonical_block_unavailable", "canonical_receipts_unavailable"] {
+            assert_eq!(
+                read_canonical_successor(position, hashes, |_| eyre::bail!(reason))
+                    .unwrap_err()
+                    .to_string(),
+                reason
+            );
+        }
+        let mut incomplete = next.clone();
+        incomplete.data.receipts = Arc::new(vec![]);
+        let recovered =
+            read_canonical_successor(position, hashes, |_| Ok(incomplete)).unwrap().unwrap();
+        let mut state = ReceiptSequence::new(position);
+        assert_eq!(state.canonical(recovered).unwrap_err(), "receipt_count_mismatch");
+        assert_eq!(state.anchor, position);
+        state.pending(snapshot(100, anchor.hash(), &[3], 1, false)).unwrap();
+        let recovered = read_from_blocks(&[anchor, next], position).unwrap().unwrap();
+        assert_eq!(state.canonical(recovered).unwrap_err(), "execution_mismatch");
+        assert_eq!(state.anchor, position);
+    }
+
+    #[test]
+    fn recovery_detects_a_branch_change_during_reads() {
+        let anchor = snapshot(99, B256::ZERO, &[], 0, true);
+        let next = snapshot(100, anchor.hash(), &[], 0, true);
+        let position = BlockNumHash::new(99, anchor.hash());
+        for changed_height in [99, 100] {
+            let mut reads = 0;
+            let result = read_canonical_successor(
+                position,
+                |n| {
+                    reads += 1;
+                    Ok(Some(if reads > 2 && n == changed_height {
+                        B256::repeat_byte(7)
+                    } else if n == 99 {
+                        anchor.hash()
+                    } else {
+                        next.hash()
+                    }))
+                },
+                |_| Ok(next.clone()),
+            );
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                if changed_height == 99 {
+                    "canonical_anchor_changed"
+                } else {
+                    "canonical_successor_changed"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_is_bounded_and_only_fills_predecessors() {
+        let state = sequence();
+        let next = snapshot(100, B256::ZERO, &[], 0, true);
+        // Process a contiguous notification before a pending child's later recovery target.
+        assert_eq!(state.needs_recovery(Some(&next), Some(200)), Ok(false));
+        let boundary = state.anchor.number + MAX_RECOVERY_BLOCKS;
+        assert_eq!(state.needs_recovery(None, Some(boundary)), Ok(true));
+        assert_eq!(state.needs_recovery(None, Some(boundary + 1)), Err("canonical_recovery_limit"));
+        let next = snapshot(boundary + 1, B256::ZERO, &[], 0, true);
+        assert_eq!(state.needs_recovery(Some(&next), None), Ok(true));
+        let too_far = snapshot(boundary + 2, B256::ZERO, &[], 0, true);
+        assert_eq!(state.needs_recovery(Some(&too_far), None), Err("canonical_recovery_limit"));
+        assert_eq!(state.needs_recovery(None, Some(99)), Ok(false));
+    }
+
+    #[test]
+    fn recovery_preserves_empty_block_seals() {
+        let anchor = snapshot(99, B256::ZERO, &[], 0, true);
+        let first = snapshot(100, anchor.hash(), &[], 0, true);
+        let second = snapshot(101, first.hash(), &[], 0, true);
+        let mut state = ReceiptSequence::new(BlockNumHash::new(99, anchor.hash()));
+        let recovered = read_from_blocks(&[anchor, first], state.anchor).unwrap().unwrap();
+        assert_eq!(
+            event_positions(&state.canonical(recovered).unwrap()),
+            vec![("seal", 100, 0, 0)]
+        );
+        assert_eq!(event_positions(&state.canonical(second).unwrap()), vec![("seal", 101, 0, 0)]);
     }
 
     #[test]
